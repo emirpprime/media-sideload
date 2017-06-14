@@ -53,10 +53,10 @@ $run_sideload_media_command = function( $args, $assoc_args ) {
 		$where = '';
 	}
 	$query = "SELECT ID, post_content FROM $wpdb->posts $where";
-
+#WP_CLI::log('query:: ' . $query);
 	// Prepare domain for use in regex.
-	$domain_str_regex = preg_quote( $domain_str );
-
+	$domain_str_regex = preg_quote( rtrim( $assoc_args['domain'], '/' ), '/' );
+#WP_CLI::log('domain_Str_regex:: ' . $domain_str_regex);
 	$num_updated_posts = 0;
 	$all_srcs = array();
 	// Loop over all posts returned by database query.
@@ -80,28 +80,73 @@ $run_sideload_media_command = function( $args, $assoc_args ) {
 
 			// Sometimes old content management systems put spaces in the URLs.
 			$item_src = esc_url_raw( str_replace( ' ', '%20', $match ) );
-			if ( ! empty( $assoc_args['domain'] ) && $assoc_args['domain'] != parse_url( $item_src, PHP_URL_HOST ) ) {
-				continue;
-			}
+#			if ( ! empty( $assoc_args['domain'] ) && $assoc_args['domain'] != parse_url( $item_src, PHP_URL_HOST ) ) {
+#				continue;
+#			}
 
 			// Don't permit the same media to be sideloaded twice for this post.
 			if ( in_array( $item_src, $this_post_srcs ) ) {
 				continue;
 			}
 
-			// Import the media file.
-			// BUG: Needs to check if file already exists and get existing file ID if so.
-			$new_item_id = WP_CLI::runcommand( "media import {$item_src} --post_id={$post->ID} --porcelain", array( 'launch' => false ) );
+			if ( ! in_array( $item_src, $all_srcs ) ) {
 
-			// Get newly imported item URL.
-			$new_item_url = wp_get_attachment_url( $id );
+				// Import the media file.
+				// BUG: This fails as wp media import tries DNS lookup of domain so fails on internal only domains.
+				//$new_item_id = WP_CLI::runcommand( "media import {$item_src} --post_id={$post->ID} --porcelain", array( 'launch' => false ) );
+				$tmp = tempnam( sys_get_temp_dir(), 'wpms' );
+				$fp = fopen( $tmp, 'w+' );
+				$ch = curl_init();
+				curl_setopt( $ch, CURLOPT_URL, $item_src );
+				curl_setopt( $ch, CURLOPT_BINARYTRANSFER, true );
+				curl_setopt( $ch, CURLOPT_RETURNTRANSFER, false );
+				curl_setopt( $ch, CURLOPT_SSL_VERIFYPEER, false );
+
+				curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, 10 );
+				curl_setopt( $ch, CURLOPT_FILE, $fp );
+				curl_exec( $ch );
+				curl_close( $ch );
+				fclose( $fp );
+
+				// Set variables for storage
+				// Fix file filename for query strings.
+				preg_match( "/[^\?]+\.($allowed_mimes)\b/i", $item_src, $item_name_matches );
+				$file_array = array();
+				$file_array['name'] = sanitize_file_name( urldecode( basename( $item_name_matches[0] ) ) );
+				$file_array['tmp_name'] = $tmp;
+
+				// If error storing temporarily, unlink.
+				if ( is_wp_error( $tmp ) ) {
+					@unlink( $file_array['tmp_name'] );
+					$file_array['tmp_name'] = '';
+					WP_CLI::warning( $tmp->get_error_message() );
+					continue;
+				}
+				// Do the validation and storage stuff.
+				$id = media_handle_sideload( $file_array, $post->ID );
+				// If error storing permanently, unlink.
+				if ( is_wp_error( $id ) ) {
+					@unlink( $file_array['tmp_name'] );
+					WP_CLI::warning( $id->get_error_message() );
+					continue;
+				}
+
+				// Get newly imported item URL.
+				$new_item_url = wp_get_attachment_url( $id );
+
+				$all_srcs[] = array( 'original' => $item_src, 'new' => $new_item_url );
+
+			} else {
+
+				$new_item_url = reset( wp_list_pluck( $all_srcs, 'new' ) );
+
+			}
 			// Replace old item URL with new item URL.
 			$post->post_content = str_replace( $match, $new_item_url, $post->post_content );
 
 			// Update records.
 			$num_sideloaded_images++;
 			$this_post_srcs[] = $img_src;
-			$all_srcs[] = $img_src;
 
 			// Inform user about progress.
 			if ( $assoc_args['verbose'] ) {
